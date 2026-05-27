@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    branches: ["master"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get install -y musl-tools
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Get version
+        id: version
+        run: echo "version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*\"\(.*\)\"/\1/')" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        run: |
+          mkdir -p staging
+          cp target/x86_64-unknown-linux-musl/release/teleporter staging/
+          cd staging
+          tar czf ../teleporter-x86_64-unknown-linux-musl.tar.gz teleporter
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          files: teleporter-x86_64-unknown-linux-musl.tar.gz
