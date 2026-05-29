@@ -1,53 +1,110 @@
+use futures::TryStreamExt;
 use std::env::var;
-use teloxide::{dispatching::UpdateFilterExt, prelude::*, types::{FileId, InputFile}};
+use teloxide::{
+    dispatching::UpdateFilterExt,
+    net::Download,
+    prelude::*,
+    types::{ChatId, FileId, InputFile},
+};
 
 #[derive(Clone)]
 struct BluePortal(Bot);
 
-pub enum Action {
-    Ignore,
-    ForwardText(String),
-    ForwardDocument { file_id: FileId, caption: Option<String> },
+fn is_from_owner(msg: &Message, owner_id: ChatId) -> bool {
+    msg.from.as_ref().map_or(false, |f| f.id == owner_id)
 }
 
-pub fn classify_message(msg: &Message, owner_id: ChatId) -> Action {
-    match &msg.from {
-        Some(from) if from.id == owner_id => {}
-        _ => return Action::Ignore,
-    }
-    if let Some(text) = msg.text() {
-        Action::ForwardText(text.to_string())
-    } else if let Some(doc) = msg.document() {
-        Action::ForwardDocument {
-            file_id: doc.file.id.clone(),
-            caption: msg.caption().map(str::to_string),
-        }
-    } else {
-        Action::Ignore
-    }
+async fn download(bot: &Bot, file_id: String) -> Option<Vec<u8>> {
+    let Ok(file) = bot.get_file(FileId(file_id.clone())).await else {
+        log::error!("get_file failed for {file_id}");
+        return None;
+    };
+    bot.download_file_stream(&file.path)
+        .try_fold(Vec::new(), |mut v, chunk| async move {
+            v.extend_from_slice(&chunk);
+            Ok(v)
+        })
+        .await
+        .map_err(|e| log::error!("Download failed: {e}"))
+        .ok()
 }
 
 async fn handle_message(
-    _bot: Bot,
+    orange_bot: Bot,
     msg: Message,
     blue_portal: BluePortal,
     owner_id: ChatId,
 ) -> ResponseResult<()> {
-    match classify_message(&msg, owner_id) {
-        Action::Ignore => {}
-        Action::ForwardText(text) => {
-            blue_portal.0.send_message(owner_id, text).await?;
-        }
-        Action::ForwardDocument { file_id, caption } => {
-            let mut req = blue_portal
-                .0
-                .send_document(owner_id, InputFile::file_id(file_id));
-            if let Some(cap) = caption {
-                req = req.caption(cap);
+    if !is_from_owner(&msg, owner_id) {
+        return Ok(());
+    }
+
+    let bot = &blue_portal.0;
+    let cap = msg.caption();
+
+    if let Some(text) = msg.text() {
+        bot.send_message(owner_id, text).await?;
+    } else if let Some(photo) = msg.photo().and_then(|p| p.last()) {
+        if let Some(bytes) = download(&orange_bot, photo.file.id.0.clone()).await {
+            let mut req = bot.send_photo(owner_id, InputFile::memory(bytes));
+            if let Some(c) = cap {
+                req = req.caption(c);
             }
             req.await?;
         }
+    } else if let Some(doc) = msg.document() {
+        if let Some(bytes) = download(&orange_bot, doc.file.id.0.clone()).await {
+            let mut file = InputFile::memory(bytes);
+            if let Some(name) = &doc.file_name {
+                file = file.file_name(name.clone());
+            }
+            let mut req = bot.send_document(owner_id, file);
+            if let Some(c) = cap {
+                req = req.caption(c);
+            }
+            req.await?;
+        }
+    } else if let Some(video) = msg.video() {
+        if let Some(bytes) = download(&orange_bot, video.file.id.0.clone()).await {
+            let mut req = bot.send_video(owner_id, InputFile::memory(bytes));
+            if let Some(c) = cap {
+                req = req.caption(c);
+            }
+            req.await?;
+        }
+    } else if let Some(audio) = msg.audio() {
+        if let Some(bytes) = download(&orange_bot, audio.file.id.0.clone()).await {
+            let mut req = bot.send_audio(owner_id, InputFile::memory(bytes));
+            if let Some(c) = cap {
+                req = req.caption(c);
+            }
+            req.await?;
+        }
+    } else if let Some(voice) = msg.voice() {
+        if let Some(bytes) = download(&orange_bot, voice.file.id.0.clone()).await {
+            let mut req = bot.send_voice(owner_id, InputFile::memory(bytes));
+            if let Some(c) = cap {
+                req = req.caption(c);
+            }
+            req.await?;
+        }
+    } else if let Some(sticker) = msg.sticker() {
+        bot.send_sticker(owner_id, InputFile::file_id(sticker.file.id.clone())).await?;
+    } else if let Some(animation) = msg.animation() {
+        if let Some(bytes) = download(&orange_bot, animation.file.id.0.clone()).await {
+            let mut req = bot.send_animation(owner_id, InputFile::memory(bytes));
+            if let Some(c) = cap {
+                req = req.caption(c);
+            }
+            req.await?;
+        }
+    } else if let Some(vn) = msg.video_note() {
+        if let Some(bytes) = download(&orange_bot, vn.file.id.0.clone()).await {
+            bot.send_video_note(owner_id, InputFile::memory(bytes))
+                .await?;
+        }
     }
+
     Ok(())
 }
 
@@ -118,60 +175,20 @@ mod tests {
     const STRANGER: i64 = 99;
 
     #[test]
-    fn ignore_message_from_non_owner() {
-        let msg = make_message(STRANGER, json!({"text": "hello"}));
-        assert!(matches!(classify_message(&msg, ChatId(OWNER)), Action::Ignore));
+    fn rejects_non_owner() {
+        let msg = make_message(STRANGER, json!({}));
+        assert!(!is_from_owner(&msg, ChatId(OWNER)));
     }
 
     #[test]
-    fn ignore_message_with_no_sender() {
-        let msg = make_message_no_sender(json!({"text": "hello"}));
-        assert!(matches!(classify_message(&msg, ChatId(OWNER)), Action::Ignore));
+    fn rejects_message_with_no_sender() {
+        let msg = make_message_no_sender(json!({}));
+        assert!(!is_from_owner(&msg, ChatId(OWNER)));
     }
 
     #[test]
-    fn forward_text_from_owner() {
-        let msg = make_message(OWNER, json!({"text": "hello world"}));
-        match classify_message(&msg, ChatId(OWNER)) {
-            Action::ForwardText(text) => assert_eq!(text, "hello world"),
-            _ => panic!("expected ForwardText"),
-        }
-    }
-
-    #[test]
-    fn forward_document_without_caption() {
-        let msg = make_message(OWNER, json!({
-            "document": {"file_id": "abc123", "file_unique_id": "u1", "file_size": 100}
-        }));
-        match classify_message(&msg, ChatId(OWNER)) {
-            Action::ForwardDocument { file_id, caption } => {
-                assert_eq!(file_id.0, "abc123");
-                assert!(caption.is_none());
-            }
-            _ => panic!("expected ForwardDocument"),
-        }
-    }
-
-    #[test]
-    fn forward_document_with_caption() {
-        let msg = make_message(OWNER, json!({
-            "document": {"file_id": "abc123", "file_unique_id": "u1", "file_size": 100},
-            "caption": "my file"
-        }));
-        match classify_message(&msg, ChatId(OWNER)) {
-            Action::ForwardDocument { file_id, caption } => {
-                assert_eq!(file_id.0, "abc123");
-                assert_eq!(caption.as_deref(), Some("my file"));
-            }
-            _ => panic!("expected ForwardDocument"),
-        }
-    }
-
-    #[test]
-    fn ignore_unsupported_content_from_owner() {
-        let msg = make_message(OWNER, json!({
-            "photo": [{"file_id": "p1", "file_unique_id": "u1", "width": 100, "height": 100}]
-        }));
-        assert!(matches!(classify_message(&msg, ChatId(OWNER)), Action::Ignore));
+    fn accepts_owner() {
+        let msg = make_message(OWNER, json!({}));
+        assert!(is_from_owner(&msg, ChatId(OWNER)));
     }
 }
